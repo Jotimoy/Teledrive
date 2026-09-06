@@ -1,0 +1,11 @@
+{
+  "name": "TeleDrive - ESP32 RC Car Remote Control",
+  "description": "Ultra low-latency teleoperation app for remote controlling an ESP32 RC Car over the internet with live WebRTC video streaming from an onboard Android phone.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
