@@ -71,9 +71,14 @@ export const CarGateway: React.FC<CarGatewayProps> = ({
   const wsRef = useRef<WebSocket | null>(null);
   const peerConnRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const bleDeviceRef = useRef<any>(null);
   const bleCharacteristicRef = useRef<any>(null);
+  const isBleReconnectingRef = useRef<boolean>(false);
   const serialWriterRef = useRef<any>(null);
   const wakeLockRef = useRef<any>(null);
+  const wsReconnectTimeoutRef = useRef<any>(null);
+  const isMountedRef = useRef<boolean>(true);
+  const connectWsRef = useRef<(() => void) | null>(null);
 
   const addLog = useCallback((source: ConsoleLogEntry['source'], type: ConsoleLogEntry['type'], message: string) => {
     const entry: ConsoleLogEntry = {
@@ -100,7 +105,20 @@ export const CarGateway: React.FC<CarGatewayProps> = ({
     };
     requestWakeLock();
 
+    // Re-acquire WakeLock if user switches apps, receives notification, or wakes phone
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        requestWakeLock();
+        if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
+          addLog('SYSTEM', 'info', 'Phone screen awake. Restoring signaling link...');
+          connectWsRef.current?.();
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       if (wakeLockRef.current) {
         wakeLockRef.current.release().catch(() => {});
       }
@@ -278,7 +296,34 @@ export const CarGateway: React.FC<CarGatewayProps> = ({
     detectBrave();
   }, []);
 
-  // 5. Connect to ESP32 via Web Bluetooth
+  // 5. Connect to ESP32 via Web Bluetooth with Auto-Reconnect on brownout / glitch
+  const retryBleConnection = useCallback(async (attempt = 1) => {
+    const dev = bleDeviceRef.current;
+    if (!dev || !dev.gatt || isBleReconnectingRef.current) return;
+    isBleReconnectingRef.current = true;
+
+    try {
+      addLog('ESP32', 'info', `Auto-reconnecting to ${dev.name || 'ESP32'} (attempt ${attempt})...`);
+      const server = await dev.gatt.connect();
+      const service = await server.getPrimaryService('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
+      const rxChar = await service.getCharacteristic('6e400002-b5a3-f393-e0a9-e50e24dcca9e');
+
+      bleCharacteristicRef.current = rxChar;
+      setEspConnected(true);
+      setEspDeviceName(dev.name || 'ESP32 (BLE)');
+      addLog('ESP32', 'success', 'ESP32 Bluetooth Auto-Reconnected successfully!');
+      isBleReconnectingRef.current = false;
+    } catch (err: any) {
+      isBleReconnectingRef.current = false;
+      if (attempt < 8 && !dev.gatt.connected) {
+        addLog('ESP32', 'warn', `BLE Reconnect attempt ${attempt} failed. Retrying in 2s...`);
+        setTimeout(() => retryBleConnection(attempt + 1), 2000);
+      } else {
+        addLog('ESP32', 'error', 'BLE Auto-reconnect stopped. If ESP32 restarted due to low battery, please tap Connect again.');
+      }
+    }
+  }, [addLog]);
+
   const connectBluetooth = async () => {
     try {
       if (!(navigator as any).bluetooth) {
@@ -294,6 +339,7 @@ export const CarGateway: React.FC<CarGatewayProps> = ({
         optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e']
       });
 
+      bleDeviceRef.current = device;
       addLog('ESP32', 'info', `Connecting to ${device.name}...`);
       const server = await device.gatt.connect();
       const service = await server.getPrimaryService('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
@@ -308,7 +354,10 @@ export const CarGateway: React.FC<CarGatewayProps> = ({
         setEspConnected(false);
         setEspDeviceName(null);
         bleCharacteristicRef.current = null;
-        addLog('ESP32', 'warn', 'ESP32 Bluetooth disconnected!');
+        addLog('ESP32', 'warn', 'ESP32 Bluetooth disconnected (possible motor brownout or range dip)! Auto-reconnecting in 1.5s...');
+        setTimeout(() => {
+          retryBleConnection(1);
+        }, 1500);
       });
     } catch (err: any) {
       const msg = err?.message || String(err);
@@ -365,7 +414,9 @@ export const CarGateway: React.FC<CarGatewayProps> = ({
   // 7. WebSocket Signaling & WebRTC Peer Connection
   const initWebRTC = useCallback((targetPilotId?: string) => {
     if (peerConnRef.current) {
-      peerConnRef.current.close();
+      try {
+        peerConnRef.current.close();
+      } catch {}
     }
 
     addLog('WEBRTC', 'info', 'Creating WebRTC PeerConnection for low-latency video stream...');
@@ -373,12 +424,47 @@ export const CarGateway: React.FC<CarGatewayProps> = ({
     peerConnRef.current = pc;
     setWebrtcStatus('connecting');
 
-    // Add local tracks
+    // Add local camera tracks
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => {
         pc.addTrack(track, localStreamRef.current!);
       });
     }
+
+    // CRITICAL FIX: Create DataChannel on Offerer BEFORE createOffer()
+    // This guarantees the SDP contains 'm=application' so DataChannel works on both ends!
+    try {
+      const dc = pc.createDataChannel('tele-drive', {
+        ordered: false,
+        maxRetransmits: 0
+      });
+      dataChannelRef.current = dc;
+      dc.onopen = () => {
+        addLog('WEBRTC', 'success', 'Direct P2P DataChannel open (Instant driving active)!');
+      };
+      dc.onmessage = (e) => {
+        try {
+          const cmd = JSON.parse(e.data);
+          sendToESP32(cmd);
+        } catch {}
+      };
+    } catch (err: any) {
+      addLog('WEBRTC', 'warn', `DataChannel init warning: ${err?.message}`);
+    }
+
+    // Also accept DataChannel if initiated by Pilot
+    pc.ondatachannel = (event) => {
+      const dc = event.channel;
+      dataChannelRef.current = dc;
+      addLog('WEBRTC', 'success', 'P2P DataChannel established with Pilot!');
+
+      dc.onmessage = (e) => {
+        try {
+          const cmd = JSON.parse(e.data);
+          sendToESP32(cmd);
+        } catch {}
+      };
+    };
 
     // ICE Candidates
     pc.onicecandidate = (event) => {
@@ -401,20 +487,6 @@ export const CarGateway: React.FC<CarGatewayProps> = ({
       }
     };
 
-    // Listen for DataChannel created by Pilot for UDP-like instant drive commands
-    pc.ondatachannel = (event) => {
-      const dc = event.channel;
-      dataChannelRef.current = dc;
-      addLog('WEBRTC', 'success', 'P2P DataChannel open for zero-latency commands!');
-
-      dc.onmessage = (e) => {
-        try {
-          const cmd = JSON.parse(e.data);
-          sendToESP32(cmd);
-        } catch {}
-      };
-    };
-
     // Create SDP Offer
     pc.createOffer({
       offerToReceiveAudio: true,
@@ -435,8 +507,13 @@ export const CarGateway: React.FC<CarGatewayProps> = ({
     });
   }, [addLog, sendToESP32]);
 
-  // 8. WebSocket Signaling Lifecycle
-  useEffect(() => {
+  // 8. WebSocket Signaling Lifecycle with Persistent Auto-Reconnection
+  const connectWs = useCallback(() => {
+    if (!isMountedRef.current) return;
+    if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
     const wsUrl = getWebSocketUrl();
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
@@ -472,7 +549,7 @@ export const CarGateway: React.FC<CarGatewayProps> = ({
             } else {
               setPilotOnline(false);
               addLog('SYSTEM', 'warn', `Pilot disconnected from room.`);
-              // Stop car immediately when pilot disconnects!
+              // Failsafe: Stop car immediately when pilot disconnects!
               sendToESP32({
                 throttle: 0,
                 steer: 0,
@@ -512,14 +589,33 @@ export const CarGateway: React.FC<CarGatewayProps> = ({
 
     ws.onclose = () => {
       setWsStatus('disconnected');
-      addLog('SYSTEM', 'warn', 'Signaling server disconnected. Reconnecting...');
+      addLog('SYSTEM', 'warn', 'Signaling server disconnected. Auto-reconnecting in 2s...');
+      if (isMountedRef.current) {
+        clearTimeout(wsReconnectTimeoutRef.current);
+        wsReconnectTimeoutRef.current = setTimeout(() => {
+          connectWs();
+        }, 2000);
+      }
     };
 
-    return () => {
-      ws.close();
-      if (peerConnRef.current) peerConnRef.current.close();
+    ws.onerror = (err) => {
+      console.warn('WS error on CarGateway:', err);
     };
   }, [roomId, addLog, initWebRTC, sendToESP32]);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    connectWsRef.current = connectWs;
+    connectWs();
+
+    return () => {
+      isMountedRef.current = false;
+      connectWsRef.current = null;
+      clearTimeout(wsReconnectTimeoutRef.current);
+      if (wsRef.current) wsRef.current.close();
+      if (peerConnRef.current) peerConnRef.current.close();
+    };
+  }, [connectWs]);
 
   // Broadcast Telemetry to Pilot every 500ms
   useEffect(() => {

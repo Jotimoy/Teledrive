@@ -28,6 +28,10 @@ export const ESP32_ARDUINO_CODE = `/*
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
+// ESP32 Power Stability: Brownout detector control registers
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
 // Detect ESP32 Arduino Core Version (v3.x vs v2.x)
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
   #define ESP32_CORE_V3 1
@@ -189,8 +193,11 @@ class MyCallbacks: public BLECharacteristicCallbacks {
 };
 
 void setup() {
+  // CRITICAL: Disable brownout detector to prevent restart during motor voltage sags!
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
   Serial.begin(115200);
-  Serial.println("[TeleDrive] ESP32 Ready...");
+  Serial.println("[TeleDrive] ESP32 Ready (Brownout protection compensated)...");
 
   // Setup GPIOs
   pinMode(PIN_IN1, OUTPUT);

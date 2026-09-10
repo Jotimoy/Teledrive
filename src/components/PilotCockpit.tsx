@@ -23,7 +23,11 @@ import {
   Download,
   Flame,
   HelpCircle,
-  Play
+  Play,
+  RotateCcw,
+  AlertTriangle,
+  X,
+  ShieldCheck
 } from 'lucide-react';
 import { DriveCommand, TelemetryData, VideoFilterSettings } from '../types';
 import { ICE_SERVERS, getWebSocketUrl, formatLatency } from '../utils/webrtc';
@@ -95,6 +99,7 @@ export const PilotCockpit: React.FC<PilotCockpitProps> = ({
   const [gamepadConnected, setGamepadConnected] = useState(false);
   const [gamepadName, setGamepadName] = useState<string>('');
   const [showControlsHelp, setShowControlsHelp] = useState(false);
+  const [showTroubleshoot, setShowTroubleshoot] = useState(false);
   const [cruiseControl, setCruiseControl] = useState(false);
   const cruiseControlRef = useRef(false);
   cruiseControlRef.current = cruiseControl;
@@ -124,6 +129,8 @@ export const PilotCockpit: React.FC<PilotCockpitProps> = ({
   const peerConnRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
   const pingIntervalRef = useRef<any>(null);
+  const wsReconnectTimerRef = useRef<any>(null);
+  const isMountedRef = useRef<boolean>(true);
   const activeKeysRef = useRef<{ [key: string]: boolean }>({});
   const lastHeartbeatTimeRef = useRef<number>(0);
   const commandRef = useRef<DriveCommand>(command);
@@ -342,7 +349,9 @@ export const PilotCockpit: React.FC<PilotCockpitProps> = ({
   // WebRTC Setup for Pilot (Receiver)
   const initWebRTC = useCallback(() => {
     if (peerConnRef.current) {
-      peerConnRef.current.close();
+      try {
+        peerConnRef.current.close();
+      } catch {}
     }
 
     const pc = new RTCPeerConnection(ICE_SERVERS);
@@ -363,7 +372,25 @@ export const PilotCockpit: React.FC<PilotCockpitProps> = ({
       if (videoRef.current && event.streams[0]) {
         videoRef.current.srcObject = event.streams[0];
         setWebrtcState('connected');
+        setCarOnline(true);
       }
+    };
+
+    // When remote DataChannel arrives from Car Phone
+    pc.ondatachannel = (event) => {
+      const dc = event.channel;
+      dataChannelRef.current = dc;
+      dc.onopen = () => {
+        addLog('P2P_DATACHANNEL_ESTABLISHED_FAST');
+      };
+      dc.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'telemetry') {
+            setTelemetry((prev) => ({ ...prev, ...msg.data }));
+          }
+        } catch {}
+      };
     };
 
     pc.onicecandidate = (event) => {
@@ -382,10 +409,15 @@ export const PilotCockpit: React.FC<PilotCockpitProps> = ({
         setWebrtcState('failed');
       }
     };
-  }, []);
+  }, [addLog]);
 
-  // WebSocket Signaling Connection
-  useEffect(() => {
+  // WebSocket Signaling Connection with Persistent Auto-Reconnection
+  const connectWs = useCallback(() => {
+    if (!isMountedRef.current) return;
+    if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
     const wsUrl = getWebSocketUrl();
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
@@ -399,6 +431,7 @@ export const PilotCockpit: React.FC<PilotCockpitProps> = ({
       }));
 
       // Periodic ping for RTT latency calculation
+      clearInterval(pingIntervalRef.current);
       pingIntervalRef.current = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({
@@ -425,9 +458,11 @@ export const PilotCockpit: React.FC<PilotCockpitProps> = ({
             if (msg.status === 'online') {
               setCarOnline(true);
               initWebRTC();
+              addLog('CAR_STREAM_ONLINE_RESUMED');
             } else {
               setCarOnline(false);
               setWebrtcState('idle');
+              addLog('CAR_STREAM_OFFLINE_DROPPED');
             }
           }
         }
@@ -469,15 +504,41 @@ export const PilotCockpit: React.FC<PilotCockpitProps> = ({
 
     ws.onclose = () => {
       setWsStatus('disconnected');
+      if (isMountedRef.current) {
+        clearTimeout(wsReconnectTimerRef.current);
+        wsReconnectTimerRef.current = setTimeout(() => {
+          connectWs();
+        }, 2000);
+      }
     };
+  }, [roomId, initWebRTC, addLog]);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    connectWs();
 
     return () => {
+      isMountedRef.current = false;
+      clearTimeout(wsReconnectTimerRef.current);
       clearInterval(pingIntervalRef.current);
-      ws.close();
+      if (wsRef.current) wsRef.current.close();
       if (peerConnRef.current) peerConnRef.current.close();
       soundEngine.stopAll();
     };
-  }, [roomId, initWebRTC]);
+  }, [connectWs]);
+
+  // Manual Force Reconnect function to re-ping car gateway
+  const forceReconnectCar = useCallback(() => {
+    addLog('REQUESTING_STREAM_RENEGOTIATION');
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'query-car-status',
+        roomId
+      }));
+    } else {
+      connectWs();
+    }
+  }, [roomId, addLog, connectWs]);
 
   // Fullscreen toggle
   const toggleFullscreen = () => {
@@ -584,6 +645,26 @@ export const PilotCockpit: React.FC<PilotCockpitProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5">
+            {/* Force Reconnect */}
+            <button
+              onClick={forceReconnectCar}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-[#1a1c24] hover:bg-cyan-950/40 text-cyan-400 border border-cyan-500/30 rounded text-xs font-mono font-bold transition-colors"
+              title="Ping Car Gateway & Re-establish WebRTC stream"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span className="hidden xl:inline">RECONNECT</span>
+            </button>
+
+            {/* Troubleshoot Disconnect Guide */}
+            <button
+              onClick={() => setShowTroubleshoot(true)}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 rounded text-xs font-mono font-bold transition-colors"
+              title="Fix Disconnection & Motor Stop Issues"
+            >
+              <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden xl:inline">FIX STOPS</span>
+            </button>
+
             {/* Simulator Toggle */}
             <button
               onClick={() => {
@@ -674,13 +755,30 @@ export const PilotCockpit: React.FC<PilotCockpitProps> = ({
                   }}
                 />
                 {!carOnline && !useVirtualSimulator && (
-                  <div className="p-3 bg-[#0a0c12] border border-[#1a1c24] rounded-lg text-center space-y-1">
-                    <p className="text-xs font-mono font-bold text-cyan-400 uppercase">
-                      ⚠️ PHYSICAL CAR PHONE STREAM STANDBY (ROOM: {roomId})
+                  <div className="p-4 bg-[#0a0c12] border border-[#1a1c24] rounded-xl text-center space-y-3 shadow-xl">
+                    <div className="flex items-center justify-center gap-2 text-cyan-400 font-mono font-bold text-xs uppercase">
+                      <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span>
+                      <span>PHYSICAL CAR PHONE STANDBY / DISCONNECTED (ROOM: {roomId})</span>
+                    </div>
+                    <p className="text-xs text-gray-400 max-w-md mx-auto leading-relaxed">
+                      If your car disconnected while driving, tap below to re-ping the car, or inspect the hardware brownout fix.
                     </p>
-                    <p className="text-[11px] text-gray-400">
-                      Open this URL on the Android phone mounted on your car, tap <strong>Start Car Streamer</strong>, and pair with ESP32. Virtual Simulator active above for test piloting!
-                    </p>
+                    <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                      <button
+                        onClick={forceReconnectCar}
+                        className="flex items-center gap-1.5 px-3.5 py-2 bg-cyan-600 hover:bg-cyan-500 text-black font-bold font-mono text-xs rounded-lg transition-all shadow-[0_0_15px_rgba(34,211,238,0.3)]"
+                      >
+                        <RotateCcw className="w-4 h-4" />
+                        FORCE RECONNECT CAR FEED
+                      </button>
+                      <button
+                        onClick={() => setShowTroubleshoot(true)}
+                        className="flex items-center gap-1.5 px-3.5 py-2 bg-[#1a1c24] hover:bg-[#252834] text-amber-300 font-bold font-mono text-xs rounded-lg border border-amber-500/40 transition-colors"
+                      >
+                        <AlertTriangle className="w-4 h-4 text-amber-400" />
+                        WHY DOES IT STOP? (FIX)
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -1119,6 +1217,119 @@ export const PilotCockpit: React.FC<PilotCockpitProps> = ({
           ESTABLISHED LINK VIA WEBSOCKETS (TLS)
         </div>
       </footer>
+
+      {/* Troubleshooting & Disconnect Modal */}
+      {showTroubleshoot && (
+        <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-4">
+          <div className="bg-[#0c0e14] border border-[#252834] rounded-2xl w-full max-w-2xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+            {/* Modal Header */}
+            <div className="px-6 py-4 border-b border-[#1a1c24] flex items-center justify-between bg-[#11141c]">
+              <div className="flex items-center gap-3">
+                <div className="w-8 h-8 rounded-lg bg-amber-500/20 border border-amber-500/40 flex items-center justify-center">
+                  <AlertTriangle className="w-5 h-5 text-amber-400" />
+                </div>
+                <div>
+                  <h2 className="text-base font-bold text-white uppercase tracking-wider">
+                    Disconnection &amp; Motor Stop Diagnostics
+                  </h2>
+                  <p className="text-xs text-gray-400 font-mono">
+                    কেন কিছুক্ষণ পর disconnect হয় এবং আর চলে না? (Root Causes &amp; Solutions)
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowTroubleshoot(false)}
+                className="p-1.5 hover:bg-white/10 rounded-lg text-gray-400 hover:text-white transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-6 overflow-y-auto space-y-5 text-sm">
+              {/* Problem 1: Motor Brownout */}
+              <div className="p-4 rounded-xl bg-[#141722] border border-amber-500/30 space-y-2">
+                <div className="flex items-center gap-2 text-amber-400 font-bold font-mono text-xs uppercase">
+                  <ShieldAlert className="w-4 h-4" />
+                  <span>#1 Cause: Motor Voltage Sag (ESP32 Brownout Reset)</span>
+                </div>
+                <p className="text-xs text-gray-300 leading-relaxed">
+                  যখন RC কার Forward এ চলা শুরু করে, মোটরগুলো এক সাথে <strong>1.5A থেকে 2A</strong> কারেন্ট টানে। যদি ESP32 এবং মোটর ড্রাইভার (L298N) একই ব্যাটারি থেকে পাওয়ার পায়, তখন ভোল্টেজ এক মুহূর্তের জন্য 2.7V এর নিচে নেমে যায়। এতে ESP32 সাথে সাথে রিবুট (Restart) হয়ে যায়!
+                </p>
+                <div className="p-3 bg-black/40 rounded-lg border border-white/5 space-y-1.5 text-xs font-mono">
+                  <p className="text-emerald-400 font-bold">✅ Solved in New Firmware:</p>
+                  <p className="text-gray-400">
+                    আমরা নতুন Arduino কোডে Brownout detector বন্ধ করে দিয়েছি (<code className="text-cyan-300">WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0)</code>) এবং BLE Auto-Reconnect যোগ করেছি।
+                  </p>
+                  <p className="text-amber-300 font-bold pt-1">💡 Hardware Tip for 100% Stability:</p>
+                  <p className="text-gray-400">
+                    ESP32 কে আলাদা একটি ছোট 5V পাওয়ার ব্যাংক বা আলাদা ব্যাটারি দিন, অথবা মোটর ড্রাইভারের 12V ও GND তে একটি <strong>1000µF 16V / 25V Capacitor</strong> লাগিয়ে দিন।
+                  </p>
+                </div>
+              </div>
+
+              {/* Problem 2: Android Sleep & Battery Optimization */}
+              <div className="p-4 rounded-xl bg-[#141722] border border-[#252834] space-y-2">
+                <div className="flex items-center gap-2 text-cyan-400 font-bold font-mono text-xs uppercase">
+                  <Zap className="w-4 h-4" />
+                  <span>#2 Cause: Android Screen Sleeping &amp; App Sleep</span>
+                </div>
+                <p className="text-xs text-gray-300 leading-relaxed">
+                  গাড়ির ফোনের স্ক্রিন লক হলে বা ব্যাকগ্রাউন্ডে চলে গেলে Android স্বয়ংক্রিয়ভাবে WebRTC ক্যামেরা ও ব্লুটুথ সংযোগ স্থগিত (freeze) করে দেয়।
+                </p>
+                <div className="p-3 bg-black/40 rounded-lg border border-white/5 text-xs space-y-1 font-mono">
+                  <p className="text-cyan-300 font-bold">Fix:</p>
+                  <p className="text-gray-400">
+                    ফোনের স্ক্রিন সবসময় চালু রাখুন (Car Gateway তে <strong>Wake Lock</strong> অ্যাক্টিভ রাখা হয়েছে)। ফোনের পাওয়ার বাটন চেপে স্ক্রিন বন্ধ করবেন না।
+                  </p>
+                </div>
+              </div>
+
+              {/* Problem 3: Reconnection Button */}
+              <div className="p-4 rounded-xl bg-[#141722] border border-[#252834] space-y-2">
+                <div className="flex items-center gap-2 text-emerald-400 font-bold font-mono text-xs uppercase">
+                  <ShieldCheck className="w-4 h-4" />
+                  <span>#3 Auto-Reconnect &amp; Manual Force Ping</span>
+                </div>
+                <p className="text-xs text-gray-300 leading-relaxed">
+                  এখন সিস্টেম যেকোনো নেটওয়ার্ক বা ব্লুটুথ ড্রপের পর ২ সেকেন্ড অন্তর স্বয়ংক্রিয়ভাবে পুনরায় সংযোগ স্থাপন করে। প্রয়োজনে নিচের বাটনে ক্লিক করে সাথে সাথে রিকানেক্ট করতে পারেন।
+                </p>
+                <div className="pt-2 flex flex-wrap gap-3">
+                  <button
+                    onClick={() => {
+                      forceReconnectCar();
+                      setShowTroubleshoot(false);
+                    }}
+                    className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-black font-bold font-mono text-xs rounded-lg transition-colors flex items-center gap-2"
+                  >
+                    <RotateCcw className="w-4 h-4" />
+                    FORCE RECONNECT CAR NOW
+                  </button>
+                  <button
+                    onClick={() => {
+                      setShowTroubleshoot(false);
+                      onOpenGuide();
+                    }}
+                    className="px-4 py-2 bg-[#1a1c24] hover:bg-[#252834] text-white font-bold font-mono text-xs rounded-lg border border-white/10 transition-colors"
+                  >
+                    VIEW UPDATED ARDUINO FIRMWARE
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="px-6 py-3 border-t border-[#1a1c24] bg-[#11141c] flex justify-end">
+              <button
+                onClick={() => setShowTroubleshoot(false)}
+                className="px-4 py-1.5 bg-[#1a1c24] hover:bg-[#252834] text-gray-200 text-xs font-mono font-bold rounded-lg border border-white/10 transition-colors"
+              >
+                CLOSE
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

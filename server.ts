@@ -205,6 +205,29 @@ wss.on("connection", (ws: WebSocket, req) => {
         return;
       }
 
+      // Pilot requesting fresh car status / handshake
+      if (msg.type === "query-car-status") {
+        const isCarOnline = !!(room.car && room.car.ws.readyState === WebSocket.OPEN);
+        ws.send(JSON.stringify({
+          type: "peer-status",
+          role: "car",
+          status: isCarOnline ? "online" : "offline",
+          carId: room.car?.id,
+          timestamp: Date.now()
+        }));
+        if (isCarOnline && room.car) {
+          // Tell car to re-initiate WebRTC handshake
+          room.car.ws.send(JSON.stringify({
+            type: "peer-status",
+            role: "pilot",
+            status: "online",
+            pilotId: clientInfo.id,
+            timestamp: Date.now()
+          }));
+        }
+        return;
+      }
+
       // Audio Talkback / Intercom signaling
       if (msg.type === "talkback") {
         if (clientInfo.role === "pilot" && room.car && room.car.ws.readyState === WebSocket.OPEN) {
